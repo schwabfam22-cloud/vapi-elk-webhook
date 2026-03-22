@@ -1,437 +1,135 @@
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+/**
+ * NEXT.JS (VERCEL) — App Router API route
+ * Paste this into: app/api/reservation-created/route.ts
+ *
+ * What it does:
+ * - Receives JSON from Base44 (or anything) when a reservation is created
+ * - Schedules a Vapi outbound call for 1 hour later
+ *
+ * REQUIRED VERCEL ENV VAR:
+ * - VAPI_PRIVATE_KEY = your Vapi private API key (UUID format)
+ *
+ * Your Vapi resources (already in your org):
+ * - assistantId: a9196290-4c32-4501-aa78-b8a4dd72034f  (Confirmations)
+ * - phoneNumberId: 0bfcb36a-5623-4d33-a711-d1891f15d7f8 (from +16268777624)
+ */
 
-  const body = req.body || {};
-  const message = body.message;
+export const runtime = "nodejs";
 
-  // We support BOTH:
-  // 1) tool-calls (from Elk Reservations assistant)
-  // 2) end-of-call-report (from Confirmations assistant)
-  if (!message || !message.type) {
-    return res.status(200).json({ ok: true });
-  }
+type Body = {
+  // These are the fields you should send from Base44.
+  // If your Base44 field names differ, either:
+  // 1) change them at the source, or
+  // 2) map them below.
+  name: string;
+  gown_number: string;
+  reservation_date: string; // any string your prompt should speak (e.g. "2026-03-30")
+  customer_phone: string; // "8482233204" or "+18482233204"
+  delayMinutes?: number; // optional override (default 60)
+};
 
-  // -----------------------------
-  // END OF CALL REPORT (Retries)
-  // -----------------------------
-  if (message.type === "end-of-call-report") {
-    try {
-      const call = message.call;
-      const assistantId = call?.assistantId || call?.assistant?.id;
+function toE164US(input: string): string {
+  const raw = String(input ?? "").trim();
+  const digits = raw.replace(/\D/g, "");
 
-      // Only process confirmations assistant calls
-      const CONFIRMATIONS_ASSISTANT_ID = "a9196290-4c32-4501-aa78-b8a4dd72034f";
-      const CONFIRMATIONS_PHONE_NUMBER_ID = "0bfcb36a-5623-4d33-a711-d1891f15d7f8";
+  if (raw.startsWith("+") && digits.length >= 10) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
 
-      if (assistantId !== CONFIRMATIONS_ASSISTANT_ID) {
-        return res.status(200).json({ ok: true, ignored: "not-confirmations-assistant" });
-      }
-
-      const endedReason = call?.endedReason;
-      const callId = call?.id;
-
-      // Find the log by latest_call_id == this callId
-      const logs = await base44List("ConfirmationLog");
-      const log = logs.find((r) => {
-        const fields = r.fields || r;
-        return String(fields.latest_call_id || "").trim() === String(callId || "").trim();
-      });
-
-      if (!log) {
-        // If no log found, do nothing (prevents accidental retry loops)
-        return res.status(200).json({ ok: true, warning: "No ConfirmationLog found for callId", callId });
-      }
-
-      const fields = log.fields || log;
-      const attemptCount = Number(fields.attempt_count || 0);
-
-      // Update last ended reason + status
-      await base44Update("ConfirmationLog", log.id || log._id, {
-        last_ended_reason: String(endedReason || ""),
-        status: endedReason === "customer-did-not-answer" ? "retry_pending" : "completed"
-      });
-
-      // If they didn't answer, schedule retries (max 2 retries)
-      if (endedReason === "customer-did-not-answer") {
-        if (attemptCount === 0) {
-          // retry in 10 minutes
-          const nextAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-          const scheduled = await vapiScheduleCall({
-            assistantId: CONFIRMATIONS_ASSISTANT_ID,
-            phoneNumberId: CONFIRMATIONS_PHONE_NUMBER_ID,
-            customerNumber: String(fields.customer_phone || "").trim(),
-            earliestAt: nextAt
-          });
-
-          await base44Update("ConfirmationLog", log.id || log._id, {
-            attempt_count: 1,
-            status: scheduled.ok ? "retry_scheduled" : "retry_schedule_failed",
-            next_call_at: nextAt,
-            latest_call_id: scheduled.ok ? (scheduled.response?.id || fields.latest_call_id) : fields.latest_call_id
-          });
-
-          return res.status(200).json({ ok: true, retry: "10min", scheduled });
-        }
-
-        if (attemptCount === 1) {
-          // retry in 60 minutes
-          const nextAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-          const scheduled = await vapiScheduleCall({
-            assistantId: CONFIRMATIONS_ASSISTANT_ID,
-            phoneNumberId: CONFIRMATIONS_PHONE_NUMBER_ID,
-            customerNumber: String(fields.customer_phone || "").trim(),
-            earliestAt: nextAt
-          });
-
-          await base44Update("ConfirmationLog", log.id || log._id, {
-            attempt_count: 2,
-            status: scheduled.ok ? "retry_scheduled" : "retry_schedule_failed",
-            next_call_at: nextAt,
-            latest_call_id: scheduled.ok ? (scheduled.response?.id || fields.latest_call_id) : fields.latest_call_id
-          });
-
-          return res.status(200).json({ ok: true, retry: "60min", scheduled });
-        }
-
-        // attemptCount >= 2 -> stop
-        await base44Update("ConfirmationLog", log.id || log._id, {
-          status: "failed",
-          next_call_at: ""
-        });
-
-        return res.status(200).json({ ok: true, retry: "none-left" });
-      }
-
-      // Answered / other ended reason: mark completed
-      await base44Update("ConfirmationLog", log.id || log._id, {
-        status: "completed",
-        next_call_at: ""
-      });
-
-      return res.status(200).json({ ok: true, completed: true });
-    } catch (e) {
-      return res.status(200).json({ ok: false, error: String(e?.message || e) });
-    }
-  }
-
-  // -----------------------------
-  // TOOL CALLS
-  // -----------------------------
-  if (message.type !== "tool-calls") {
-    return res.status(200).json({ ok: true });
-  }
-
-  const toolCallList = message.toolCallList || [];
-  const results = [];
-
-  for (const tc of toolCallList) {
-    const toolCallId = tc.id || tc.toolCallId;
-    const name = tc.function?.name || tc.name;
-
-    const args =
-      typeof tc.function?.arguments === "string"
-        ? safeJsonParse(tc.function.arguments, {})
-        : (tc.function?.arguments || tc.arguments || {});
-
-    // --------------------------
-    // submit_reservation
-    // --------------------------
-    if (name === "submit_reservation") {
-      const RESERVATION_ENTITY = "Reservation";
-
-      const toNumber = String(args.phone_number || "").trim();
-
-      const payload = {
-        gown_number: String(args.gown_number || "").trim(),
-        phone_number: toNumber,
-        name: String(args.name || "").trim(),
-        email: String(args.email_address || "").trim(),
-        reservation_date: String(args.date || "").trim(),
-        gown_returned: false,
-        notes: "",
-        call_sent: true
-      };
-
-      // 1) Write reservation to Base44
-      const write = await base44Create(RESERVATION_ENTITY, payload);
-
-      if (!write.ok) {
-        results.push({
-          toolCallId,
-          result: {
-            ok: false,
-            reservationWritten: false,
-            base44: write
-          }
-        });
-        continue;
-      }
-
-      const reservationId = write.response?.id || write.response?._id || write.response?.data?.id || null;
-
-      // 2) Schedule confirmation call +90 minutes (reservation should succeed even if call scheduling fails)
-      const earliestAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
-
-      const scheduled = await vapiScheduleCall({
-        assistantId: "a9196290-4c32-4501-aa78-b8a4dd72034f",
-        phoneNumberId: "0bfcb36a-5623-4d33-a711-d1891f15d7f8",
-        customerNumber: toNumber,
-        earliestAt
-      });
-
-      // 3) Create ConfirmationLog record (do not touch Reservation)
-      const logCreate = await base44Create("ConfirmationLog", {
-        reservation_id: reservationId ? String(reservationId) : "",
-        customer_phone: toNumber,
-        initial_call_id: scheduled.ok ? String(scheduled.response?.id || "") : "",
-        latest_call_id: scheduled.ok ? String(scheduled.response?.id || "") : "",
-        attempt_count: 0,
-        status: scheduled.ok ? "scheduled" : "schedule_failed",
-        next_call_at: earliestAt,
-        last_ended_reason: ""
-      });
-
-      results.push({
-        toolCallId,
-        result: {
-          ok: true,
-          reservationWritten: true,
-          base44Reservation: write,
-          confirmationScheduled: scheduled, // may be ok:false; reservation still succeeded
-          confirmationLog: logCreate // best-effort
-        }
-      });
-
-      continue;
-    }
-
-    // --------------------------
-    // check_gown_availability
-    // --------------------------
-    if (name === "check_gown_availability") {
-      const gown = String(args.gown_number || "").trim();
-      const dateStr = String(args.date || "").trim();
-
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-        results.push({
-          toolCallId,
-          result: {
-            ok: false,
-            error: "Date must be YYYY-MM-DD (include year).",
-            received: dateStr
-          }
-        });
-        continue;
-      }
-
-      const target = new Date(dateStr + "T00:00:00Z");
-      if (isNaN(target.getTime())) {
-        results.push({
-          toolCallId,
-          result: { ok: false, error: "Invalid date.", received: dateStr }
-        });
-        continue;
-      }
-
-      // Window: [target-9d, target+3d]
-      const start = new Date(target);
-      start.setUTCDate(start.getUTCDate() - 9);
-
-      const end = new Date(target);
-      end.setUTCDate(end.getUTCDate() + 3);
-
-      const list = await base44List("Reservation");
-      if (!list.ok) {
-        results.push({
-          toolCallId,
-          result: { ok: false, error: "Failed to list reservations", details: list }
-        });
-        continue;
-      }
-
-      const rows = list.rows;
-      const conflicts = [];
-
-      for (const r of rows) {
-        const fields = r.fields || r;
-
-        const rGown = String(fields.gown_number || "").trim();
-        if (!rGown || rGown !== gown) continue;
-
-        const rDateStr = String(fields.reservation_date || fields.date || "").trim();
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(rDateStr)) continue;
-
-        const rDate = new Date(rDateStr + "T00:00:00Z");
-        if (isNaN(rDate.getTime())) continue;
-
-        if (rDate >= start && rDate <= end) {
-          conflicts.push({
-            id: r.id || r._id || null,
-            gown_number: rGown,
-            reservation_date: rDateStr,
-            name: fields.name || null,
-            phone_number: fields.phone_number || null
-          });
-        }
-      }
-
-      results.push({
-        toolCallId,
-        result: {
-          ok: true,
-          available: conflicts.length === 0,
-          gown_number: gown,
-          targetDate: dateStr,
-          window: {
-            start: start.toISOString().slice(0, 10),
-            end: end.toISOString().slice(0, 10)
-          },
-          conflictCount: conflicts.length,
-          conflicts
-        }
-      });
-
-      continue;
-    }
-
-    results.push({
-      toolCallId,
-      result: { ok: false, error: `No handler implemented for ${name}` }
-    });
-  }
-
-  return res.status(200).json({ results });
+  throw new Error(`Invalid US phone number: ${input}`);
 }
 
-/** --------------------------
- *  Vapi helper
- *  -------------------------- */
-async function vapiScheduleCall({ assistantId, phoneNumberId, customerNumber, earliestAt }) {
-  if (!process.env.VAPI_PRIVATE_KEY) {
-    return { ok: false, error: "Missing VAPI_PRIVATE_KEY env var" };
-  }
+function isoInMinutes(minutes: number): string {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+async function scheduleVapiCall(body: Body) {
+  const key = process.env.VAPI_PRIVATE_KEY;
+  if (!key) throw new Error("Missing env var VAPI_PRIVATE_KEY (set it in Vercel)");
+
+  const assistantId = "a9196290-4c32-4501-aa78-b8a4dd72034f";
+  const phoneNumberId = "0bfcb36a-5623-4d33-a711-d1891f15d7f8";
+
+  const delayMinutes = Number.isFinite(body.delayMinutes as number)
+    ? Number(body.delayMinutes)
+    : 60;
+
+  const earliestAt = isoInMinutes(delayMinutes);
+  const customerNumber = toE164US(body.customer_phone);
+
+  const payload = {
+    assistantId,
+    phoneNumberId,
+    customer: { number: customerNumber },
+    schedulePlan: { earliestAt },
+
+    // RECOMMENDED:
+    // Update your assistant firstMessage to use flat vars:
+    // {{name}}, {{gown_number}}, {{reservation_date}}
+    assistantOverrides: {
+      variableValues: {
+        name: body.name,
+        gown_number: body.gown_number,
+        reservation_date: body.reservation_date
+      }
+    }
+  };
 
   const resp = await fetch("https://api.vapi.ai/call", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.VAPI_PRIVATE_KEY}`,
+      Authorization: `Bearer ${key}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      assistantId,
-      phoneNumberId,
-      customer: { number: customerNumber },
-      schedulePlan: { earliestAt }
-    })
+    body: JSON.stringify(payload)
   });
 
-  const data = await safeReadJson(resp);
-
-  return {
-    ok: resp.ok,
-    status: resp.status,
-    earliestAt,
-    response: data
-  };
-}
-
-/** --------------------------
- *  Base44 helpers
- *  -------------------------- */
-const BASE44_APP_ID = "6993becb0552ab79e616a46d";
-const BASE44_BASE_URL = `https://ezralkallahreservations.base44.app/api/apps/${BASE44_APP_ID}/entities`;
-
-async function base44Create(entityName, fields) {
-  try {
-    const url = `${BASE44_BASE_URL}/${encodeURIComponent(entityName)}`;
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        api_key: process.env.BASE44_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(fields)
-    });
-
-    const data = await safeReadJson(resp);
-
-    return { ok: resp.ok, status: resp.status, response: data };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Vapi POST /call failed (${resp.status}): ${text}`);
   }
+
+  return await resp.json();
 }
 
-async function base44List(entityName) {
+export async function POST(req: Request) {
   try {
-    const url = `${BASE44_BASE_URL}/${encodeURIComponent(entityName)}`;
+    const body = (await req.json()) as Partial<Body>;
 
-    const resp = await fetch(url, {
-      headers: {
-        api_key: process.env.BASE44_API_KEY,
-        "Content-Type": "application/json"
+    // Basic validation
+    if (!body.name) throw new Error("Missing field: name");
+    if (!body.gown_number) throw new Error("Missing field: gown_number");
+    if (!body.reservation_date) throw new Error("Missing field: reservation_date");
+    if (!body.customer_phone) throw new Error("Missing field: customer_phone");
+
+    const vapiCall = await scheduleVapiCall(body as Body);
+
+    return Response.json({
+      ok: true,
+      scheduled: {
+        callId: vapiCall.id,
+        status: vapiCall.status,
+        customer: vapiCall.customer?.number,
+        earliestAt: vapiCall.schedulePlan?.earliestAt ?? null
       }
     });
-
-    const data = await safeReadJson(resp);
-
-    if (!resp.ok) return { ok: false, status: resp.status, response: data };
-
-    const rows = normalizeBase44List(data);
-    return { ok: true, status: resp.status, rows };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
+  } catch (err: any) {
+    return Response.json(
+      { ok: false, error: err?.message ?? "Unknown error" },
+      { status: 400 }
+    );
   }
 }
 
-async function base44Update(entityName, id, fields) {
-  try {
-    if (!id) return { ok: false, error: "Missing Base44 record id" };
-
-    // Many Base44 installs support PATCH /entities/<Entity>/<id>
-    const url = `${BASE44_BASE_URL}/${encodeURIComponent(entityName)}/${encodeURIComponent(id)}`;
-
-    const resp = await fetch(url, {
-      method: "PATCH",
-      headers: {
-        api_key: process.env.BASE44_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(fields)
-    });
-
-    const data = await safeReadJson(resp);
-
-    return { ok: resp.ok, status: resp.status, response: data };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
-  }
-}
-
-/** --------------------------
- *  Generic helpers
- *  -------------------------- */
-function safeJsonParse(str, fallback) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
-}
-
-async function safeReadJson(resp) {
-  const text = await resp.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw: text };
-  }
-}
-
-function normalizeBase44List(data) {
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data.data)) return data.data;
-  if (Array.isArray(data.results)) return data.results;
-  if (Array.isArray(data.entities)) return data.entities;
-  return [];
-}
+/**
+ * QUICK TEST (after deploy):
+ * curl -X POST "https://YOUR-VERCEL-DOMAIN.vercel.app/api/reservation-created" \
+ *  -H "Content-Type: application/json" \
+ *  -d '{
+ *    "name":"Alyssa",
+ *    "gown_number":"127",
+ *    "reservation_date":"2026-03-30",
+ *    "customer_phone":"8482233204",
+ *    "delayMinutes": 60
+ *  }'
+ */
