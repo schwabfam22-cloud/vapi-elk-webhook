@@ -65,7 +65,17 @@ export default async function handler(req, res) {
     // --- check_gown_availability: check Base44 reservations ---
     if (name === "check_gown_availability") {
       const gown = String(args.gown_number || "").trim();
-      const dateStr = String(args.date || "").trim(); // model often sends YYYY-MM-DD
+      const dateStr = String(args.date || "").trim(); // model often sends YYYY-MM-DD if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+  results.push({
+    toolCallId,
+    result: {
+      ok: false,
+      error: "Date must be YYYY-MM-DD (include year).",
+      received: dateStr
+    }
+  });
+  continue;
+}
 
       const target = parseDateAsUTC(dateStr);
       if (!target) {
