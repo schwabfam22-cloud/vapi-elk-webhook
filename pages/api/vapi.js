@@ -27,7 +27,7 @@ export default async function handler(req, res) {
         name: String(args.name || ""),
         email: String(args.email_address || ""),
         reservation_date: String(args.date || ""),
-        notes: "Created by Vapi",
+        notes: "",
         call_sent: true
       };
 
